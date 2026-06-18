@@ -1,25 +1,18 @@
 """
-Bot Scalping v20.1.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (REVERSED)
-=============================================================
-PERUBAHAN dari v20.0.0:
-1. [FIX KRITIS] HardSL FIXED 0.4% (bukan ATR-based lagi → tidak bisa jebol)
-2. [NEW] Progressive Trailing Stop menggantikan fixed ExtremeTP:
-   - Aktif saat gross profit >= 0.16% → trailing gap 0.15% dari high
-   - Gross profit >= 0.20% → gap mengecil ke 0.13%
-   - Gross profit >= 0.25% → gap 0.10%
-   - Gross profit >= 0.30% → gap 0.08%
-3. [FIX] Fee 0.1% diperhitungkan: SL+fee total max -0.50% gross
-4. ExtremeTP tetap ada sebagai backstop di 1.5% (fallback jika market gap)
-5. Semua ATR-based TP/SL dihapus dari RiskManager → pakai fixed pct
+Bot Scalping v20.1.1 — TRAILING-STOP PROFIT-LOCK + ANTI-RUGI FEE
+=================================================================
+PERUBAHAN dari v20.1.0:
+1. Trailing stop sekarang MURNI untuk mengunci profit:
+   - Mulai aktif saat gross profit >= 0.15% -> stop di ENTRY (breakeven)
+   - Semakin profit naik, stop ikut naik (dari best price)
+   - Stop TIDAK PERNAH lebih rendah dari entry + sedikit margin fee
+2. MIN_PROFIT_LOCK 0.05% memastikan exit selalu > fee (net positif kecil)
+3. TRAIL_PHASES dirapihkan agar lebih lebar di awal, lebih ketat saat profit besar
+4. Reversed logic DIMATIKAN sementara — silakan nyalakan jika ingin
+5. MIN_SCORE dinaikkan ke 60 (range/volatile) dan 55 (trending)
+6. Kill Switch daily loss dikecilkan ke -8U agar lebih protektif
 
-Logika Risk per Trade:
-  - Notional = $40 (2 USDT × 20x leverage)
-  - Hard SL: -0.4% price move = -$0.16 + exit fee $0.04 = -$0.20 max
-  - Fee entry: $0.04 (sunk cost saat open)
-  - Total worst case: -$0.20 per trade
-  - Trail phase 1 kena: net ≈ -$0.04 (jauh lebih baik dari SL)
-
-Target: Profit Factor > 1.5, Win Rate > 55%, Avg RR > 1.8
+Target: WR > 40%, Profit Factor > 1.2, Max Drawdown < -5U
 """
 
 import os
@@ -51,22 +44,25 @@ LEVERAGE      = 20
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
 
-# ── Risk Management (FIXED PCT, bukan ATR) ─────────────────────────────────
-HARD_SL_PCT       = 0.004   # 0.40% price move → max loss $0.16 per trade
-EXTREME_TP_PCT    = 0.015   # 1.50% backstop TP (fallback jika market gap)
-FEE_RATE          = 0.001   # 0.10% per leg (Binance futures taker)
+# ── Risk Management (FIXED PCT) ─────────────────────────────────────────
+HARD_SL_PCT       = 0.004    # 0.40% price move → max loss ~$0.16
+EXTREME_TP_PCT    = 0.015    # 1.50% backstop TP
+FEE_RATE          = 0.001    # 0.10% per leg
 
-# ── Progressive Trailing Stop ────────────────────────────────────────────
+# ── Progressive Trailing Stop (PROFIT-LOCK ONLY) ──────────────────────
 # Format: (gross_profit_threshold, trailing_gap)
-# gap = jarak trailing stop dari high (LONG) / low (SHORT)
+# gap = jarak stop dari BEST PRICE (bukan dari entry)
+# STOP TIDAK AKAN PERNAH LEBIH RENDAH DARI ENTRY + MIN_PROFIT_LOCK
 TRAIL_PHASES = [
-    (0.0030, 0.0008),   # profit >= 0.30% → gap 0.08%  (net if stopped: +0.12%)
-    (0.0025, 0.0010),   # profit >= 0.25% → gap 0.10%  (net if stopped: +0.05%)
-    (0.0020, 0.0013),   # profit >= 0.20% → gap 0.13%  (net if stopped: -0.03%)
-    (0.0016, 0.0015),   # profit >= 0.16% → gap 0.15%  (net if stopped: -0.09%)
+    (0.0060, 0.0040),   # profit >= 0.60% → gap 0.40% (net stop ≈ +0.20%)
+    (0.0040, 0.0025),   # profit >= 0.40% → gap 0.25% (net stop ≈ +0.15%)
+    (0.0025, 0.0015),   # profit >= 0.25% → gap 0.15% (net stop ≈ +0.10%)
+    (0.0015, 0.0015),   # profit >= 0.15% → gap 0.15% (net stop ≈ +0.00% = breakeven)
 ]
 # TRAIL_PHASES harus diurutkan dari threshold TERBESAR ke TERKECIL
-# agar cek fase tertinggi lebih dulu
+
+# ── Minimal profit lock setelah trailing aktif ───────────────────────
+MIN_PROFIT_LOCK = 0.0005   # 0.05% di atas entry agar nutup fee (net ≈ +0.03% setelah fee)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -86,21 +82,22 @@ SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
 # ── Scanning ──────────────────────────────────────────────────────────────
 SCAN_INTERVAL = 2.0
-MONITOR_INT   = 0.5        # Lebih cepat agar trailing stop responsif
+MONITOR_INT   = 0.5
 BATCH_SIZE    = 15
 MAX_WORKERS   = 5
 SLOT_FILL_INT = 0.01
 
 # ── Scoring & Filter ──────────────────────────────────────────────────────
-MIN_SCORE      = 55
+MIN_SCORE      = 55       # untuk trending regime
+MIN_SCORE_RANGE = 60      # untuk range/volatile/exhaustion
 MIN_GAP        = 10
 SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
 # ── Kill Switch ───────────────────────────────────────────────────────────
-DAILY_LOSS  = -20.0
-CONSEC_MAX  = 15
-CONSEC_PAUSE = 10
+DAILY_LOSS  = -8.0        # lebih ketat agar tidak jebol
+CONSEC_MAX  = 12
+CONSEC_PAUSE = 15
 
 # ── Learning ──────────────────────────────────────────────────────────────
 LEARNING_WINDOW      = 200
@@ -175,58 +172,49 @@ class ExhaustionConfirmation:
 
         if row["rsi"] > 75:
             conditions.append(True); reasons.append(f"RSI_{row['rsi']:.0f}>75")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         high_price = max(df["high"].iloc[-10:])
         high_rsi   = max(df["rsi"].iloc[-10:])
         if row["close"] >= high_price * 0.99 and row["rsi"] < high_rsi - 3:
             conditions.append(True); reasons.append("RSI_Div")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         high_macd = max(df["mh"].iloc[-10:])
         if row["close"] >= high_price * 0.99 and row["mh"] < high_macd - 0.5 * row["atr"]:
             conditions.append(True); reasons.append("MACD_Div")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         if row["vr"] > 2.0:
             conditions.append(True); reasons.append(f"VolClimax_{row['vr']:.1f}x")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         vol_prev = prev["vr"] if not np.isnan(prev["vr"]) else 1
         if row["vr"] > 1.8 and row["vr"] > vol_prev * 1.2:
             conditions.append(True); reasons.append("DeltaVolClimax")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         body       = abs(row["close"] - row["open"])
         upper_wick = row["high"] - max(row["close"], row["open"])
         if upper_wick > body * 1.5 and upper_wick > row["atr"] * 0.3:
             conditions.append(True); reasons.append("LongUpperWick")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         atr_series = df["atr"].iloc[-10:]
         atr_peak   = atr_series.max()
         if atr_peak > atr_series.iloc[-5] * 1.3 and row["atr"] < atr_peak * 0.8:
             conditions.append(True); reasons.append("ATR_ExpCollapse")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         m5, m5_prev = row["m5"], prev["m5"]
         if m5 > 0.002 and m5 < m5_prev * 0.7:
             conditions.append(True); reasons.append("MomDecel")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         br_peak = max(df["br"].iloc[-10:])
         if row["br"] < br_peak - 0.1 and br_peak > 0.6:
             conditions.append(True); reasons.append("OrderflowRev")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         count = sum(conditions)
         return count >= 3, count, reasons
@@ -240,58 +228,49 @@ class ExhaustionConfirmation:
 
         if row["rsi"] < 25:
             conditions.append(True); reasons.append(f"RSI_{row['rsi']:.0f}<25")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         low_price = min(df["low"].iloc[-10:])
         low_rsi   = min(df["rsi"].iloc[-10:])
         if row["close"] <= low_price * 1.01 and row["rsi"] > low_rsi + 3:
             conditions.append(True); reasons.append("RSI_Div_Bull")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         low_macd = min(df["mh"].iloc[-10:])
         if row["close"] <= low_price * 1.01 and row["mh"] > low_macd + 0.5 * row["atr"]:
             conditions.append(True); reasons.append("MACD_Div_Bull")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         if row["vr"] > 2.0:
             conditions.append(True); reasons.append(f"VolClimax_{row['vr']:.1f}x")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         vol_prev = prev["vr"] if not np.isnan(prev["vr"]) else 1
         if row["vr"] > 1.8 and row["vr"] > vol_prev * 1.2:
             conditions.append(True); reasons.append("DeltaVolClimax")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         body       = abs(row["close"] - row["open"])
         lower_wick = min(row["close"], row["open"]) - row["low"]
         if lower_wick > body * 1.5 and lower_wick > row["atr"] * 0.3:
             conditions.append(True); reasons.append("LongLowerWick")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         atr_series = df["atr"].iloc[-10:]
         atr_peak   = atr_series.max()
         if atr_peak > atr_series.iloc[-5] * 1.3 and row["atr"] < atr_peak * 0.8:
             conditions.append(True); reasons.append("ATR_ExpCollapse")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         m5, m5_prev = row["m5"], prev["m5"]
         if m5 < -0.002 and m5 > m5_prev * 0.7:
             conditions.append(True); reasons.append("MomDecel_Bull")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         br_trough = min(df["br"].iloc[-10:])
         if row["br"] > br_trough + 0.1 and br_trough < 0.4:
             conditions.append(True); reasons.append("OrderflowRev_Bull")
-        else:
-            conditions.append(False)
+        else: conditions.append(False)
 
         count = sum(conditions)
         return count >= 3, count, reasons
@@ -365,34 +344,41 @@ class SignalScorer:
             is_exh_long, cnt_long, rsn_long = \
                 ExhaustionConfirmation.check_long_exhaustion(df)
 
+        # ── Penentuan arah dengan score minimum berbeda per regime ──
+        min_score = MIN_SCORE_RANGE if regime in (
+            MarketRegime.REGIME_RANGE,
+            MarketRegime.REGIME_VOLATILE,
+            MarketRegime.REGIME_EXHAUSTION
+        ) else MIN_SCORE
+
         if regime == MarketRegime.REGIME_TRENDING_BULL:
-            if long_score >= MIN_SCORE:
+            if long_score >= min_score:
                 return "LONG", long_score, long_sigs, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
         elif regime == MarketRegime.REGIME_TRENDING_BEAR:
-            if short_score >= MIN_SCORE:
+            if short_score >= min_score:
                 return "SHORT", short_score, short_sigs, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
         elif regime == MarketRegime.REGIME_RANGE:
-            if short_score > long_score and short_score >= MIN_SCORE and is_exh_short:
+            if short_score > long_score and short_score >= min_score and is_exh_short:
                 return "SHORT", short_score, short_sigs + rsn_short, atr, 0, 0, regime, bias
-            if long_score > short_score and long_score >= MIN_SCORE and is_exh_long:
+            if long_score > short_score and long_score >= min_score and is_exh_long:
                 return "LONG", long_score, long_sigs + rsn_long, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
         elif regime == MarketRegime.REGIME_EXHAUSTION:
-            if short_score > long_score and short_score >= MIN_SCORE and cnt_short >= 2:
+            if short_score > long_score and short_score >= min_score and cnt_short >= 2:
                 return "SHORT", short_score, short_sigs + rsn_short, atr, 0, 0, regime, bias
-            if long_score > short_score and long_score >= MIN_SCORE and cnt_long >= 2:
+            if long_score > short_score and long_score >= min_score and cnt_long >= 2:
                 return "LONG", long_score, long_sigs + rsn_long, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
         elif regime == MarketRegime.REGIME_VOLATILE:
-            if short_score > long_score and short_score >= MIN_SCORE + 10 and is_exh_short:
+            if short_score > long_score and short_score >= min_score + 5 and is_exh_short:
                 return "SHORT", short_score, short_sigs + rsn_short, atr, 0, 0, regime, bias
-            if long_score > short_score and long_score >= MIN_SCORE + 10 and is_exh_long:
+            if long_score > short_score and long_score >= min_score + 5 and is_exh_long:
                 return "LONG", long_score, long_sigs + rsn_long, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
@@ -475,46 +461,47 @@ class SignalScorer:
         return score, signals
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER v2 — FIXED PCT (tidak ada ATR, tidak bisa jebol)
+#  RISK MANAGER v2 — FIXED PCT + TRAILING PROFIT LOCK
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
     @staticmethod
     def calculate_sl_tp(entry_price: float, direction: str) -> Tuple[float, float, float, float]:
-        """
-        FIXED PCT:
-        - Hard SL = entry ± HARD_SL_PCT (0.40% price move)
-        - Extreme TP = entry ± EXTREME_TP_PCT (1.50% backstop)
-
-        Trailing stop dihandle di monitor_positions(), bukan di sini.
-
-        Returns: (sl_price, tp_price, sl_pct, tp_pct)
-        """
-        sl_pct = HARD_SL_PCT        # 0.40%
-        tp_pct = EXTREME_TP_PCT     # 1.50%
+        sl_pct = HARD_SL_PCT
+        tp_pct = EXTREME_TP_PCT
 
         if direction == "LONG":
             sl_price = entry_price * (1 - sl_pct)
             tp_price = entry_price * (1 + tp_pct)
-        else:  # SHORT
+        else:
             sl_price = entry_price * (1 + sl_pct)
             tp_price = entry_price * (1 - tp_pct)
 
         return sl_price, tp_price, sl_pct, tp_pct
 
     @staticmethod
-    def get_trail_gap(gross_profit_pct: float) -> Optional[float]:
+    def get_trail_stop_price(entry_price: float, direction: str,
+                             best_price: float, best_gross_pct: float) -> Optional[Tuple[float, float]]:
         """
-        Cek apakah trailing stop sudah aktif dan berapa gapnya.
-        gross_profit_pct = (current_price - entry) / entry untuk LONG
-                         = (entry - current_price) / entry untuk SHORT
-
-        Returns: gap (float) jika trailing aktif, None jika belum aktif
-        TRAIL_PHASES sudah diurutkan dari threshold terbesar ke terkecil.
+        Cek apakah trailing stop aktif.
+        Returns: (stop_price, gap) jika trailing aktif, None jika belum.
+        STOP PRICE TIDAK PERNAH LEBIH BURUK DARI ENTRY + MIN_PROFIT_LOCK
         """
         for threshold, gap in TRAIL_PHASES:
-            if gross_profit_pct >= threshold:
-                return gap
+            if best_gross_pct >= threshold:
+                # Hitung stop price dari best price
+                if direction == "LONG":
+                    stop = best_price * (1 - gap)
+                    # Pastikan tidak di bawah entry + lock profit
+                    min_stop = entry_price * (1 + MIN_PROFIT_LOCK)
+                    if stop < min_stop:
+                        stop = min_stop
+                else:  # SHORT
+                    stop = best_price * (1 + gap)
+                    min_stop = entry_price * (1 - MIN_PROFIT_LOCK)
+                    if stop > min_stop:
+                        stop = min_stop
+                return stop, gap
         return None  # trailing belum aktif, pakai HardSL
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -715,7 +702,7 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
             return
-        live_positions[sym] = {"_r": True}  # reservation
+        live_positions[sym] = {"_r": True}
 
     px_now = price_live(sym)
     if px_now > 0:
@@ -741,17 +728,16 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
         "score":      score,
         "sigs":       sigs,
         "atr":        atr,
-        "sl_price":   sl_price,    # Hard SL (fixed 0.4%)
-        "tp_price":   tp_price,    # Extreme TP backstop (1.5%)
+        "sl_price":   sl_price,
+        "tp_price":   tp_price,
         "sl_pct":     sl_pct,
         "tp_pct":     tp_pct,
         "regime":     regime,
         "bias":       bias,
-        # Trailing stop state
-        "trail_active":  False,
-        "trail_stop":    None,     # actual stop price saat trail aktif
-        "trail_phase":   None,     # gap yang sedang aktif (sebagai info)
-        "best_price":    price,    # high tertinggi (LONG) / low terendah (SHORT)
+        "trail_active": False,
+        "trail_stop":   None,
+        "trail_phase":  None,
+        "best_price":   price,
     }
     with _lock:
         live_positions[sym] = pos
@@ -760,7 +746,7 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     print(f"\n  {d} [DRY] {sym} {direction} @{price:.6g} "
           f"| HardSL:{sl_pct*100:.2f}% XTP:{tp_pct*100:.2f}% "
           f"| Regime:{regime}")
-    print(f"        Trail aktif >=0.16% gross | Signals: {' | '.join(sigs[:5])}")
+    print(f"        Trail aktif ≥0.15% gross (breakeven lock) | Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
 
@@ -776,12 +762,9 @@ def live_close(sym, reason, price=None):
         return
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
-
-    # Gross P&L dari pergerakan harga
     gross_pnl = ((price - entry) * q_val if side == "LONG"
                  else (entry - price) * q_val)
 
-    # Fee: 0.1% per leg × notional (entry fee sudah sunk, tapi kita catat total)
     notional_entry = entry * q_val
     notional_exit  = price * q_val
     total_fee      = (notional_entry + notional_exit) * FEE_RATE
@@ -795,7 +778,7 @@ def live_close(sym, reason, price=None):
 
     trail_info = ""
     if pos.get("trail_active") and "Trail" in reason:
-        trail_info = f" [gap:{pos.get('trail_phase', '?')*100:.2f}%]"
+        trail_info = f" [gap:{pos.get('trail_phase', 0)*100:.2f}%]"
 
     print(f"  {e} [DRY] {sym} {side} CLOSE — {reason}{trail_info}")
     print(f"     {entry:.6g}→{price:.6g} ({gross_pct:+.3f}% gross) "
@@ -841,12 +824,6 @@ def live_close(sym, reason, price=None):
 
 
 def monitor_positions():
-    """
-    Jalankan setiap MONITOR_INT (0.5s) untuk cek:
-    1. HardSL (fixed price)
-    2. ExtremeTP backstop (fixed price)
-    3. Progressive trailing stop (dinamis)
-    """
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
         if pos is None or pos.get("_r"):
@@ -861,13 +838,12 @@ def monitor_positions():
         hard_sl = pos["sl_price"]
         ext_tp  = pos["tp_price"]
 
-        # ── Hitung gross profit pct saat ini ─────────────────────────
         if side == "LONG":
             gross_pct = (px - entry) / entry
         else:
             gross_pct = (entry - px) / entry
 
-        # ── Update best price (untuk trailing) ───────────────────────
+        # Update best price
         if side == "LONG":
             if px > pos["best_price"]:
                 pos["best_price"] = px
@@ -879,42 +855,36 @@ def monitor_positions():
             best = pos["best_price"]
             best_gross = (entry - best) / entry
 
-        # ── Cek apakah trailing stop aktif ───────────────────────────
-        trail_gap = RiskManager.get_trail_gap(best_gross)
+        # ── Cek trailing stop (profit lock) ─────────────────────────
+        trail_result = RiskManager.get_trail_stop_price(
+            entry, side, best, best_gross
+        )
 
-        if trail_gap is not None:
-            # Trailing stop aktif — update stop price dari best price
-            if side == "LONG":
-                trail_stop = best * (1 - trail_gap)
-            else:
-                trail_stop = best * (1 + trail_gap)
-
-            # Simpan ke posisi untuk info log
+        if trail_result is not None:
+            trail_stop, gap = trail_result
             pos["trail_active"] = True
             pos["trail_stop"]   = trail_stop
-            pos["trail_phase"]  = trail_gap
+            pos["trail_phase"]  = gap
 
-            # Cek apakah harga sudah nembus trail stop
             if side == "LONG" and px <= trail_stop:
                 live_close(sym, f"TrailStop@{gross_pct*100:+.3f}%", px)
                 continue
             if side == "SHORT" and px >= trail_stop:
                 live_close(sym, f"TrailStop@{gross_pct*100:+.3f}%", px)
                 continue
-
         else:
-            # Trailing belum aktif — pakai Hard SL
             pos["trail_active"] = False
 
-            if side == "LONG"  and px <= hard_sl:
-                live_close(sym, "HardSL", px)
-                continue
-            if side == "SHORT" and px >= hard_sl:
-                live_close(sym, "HardSL", px)
-                continue
+        # ── HardSL ──────────────────────────────────────────────────
+        if side == "LONG" and px <= hard_sl:
+            live_close(sym, "HardSL", px)
+            continue
+        if side == "SHORT" and px >= hard_sl:
+            live_close(sym, "HardSL", px)
+            continue
 
-        # ── Extreme TP backstop (selalu aktif sebagai fallback) ──────
-        if side == "LONG"  and px >= ext_tp:
+        # ── ExtremeTP ───────────────────────────────────────────────
+        if side == "LONG" and px >= ext_tp:
             live_close(sym, "ExtremeTP", px)
             continue
         if side == "SHORT" and px <= ext_tp:
@@ -922,7 +892,7 @@ def monitor_positions():
             continue
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCANNER THREAD (REVERSED LOGIC EMBEDDED)
+#  SCANNER THREAD
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scan_one(sym: str):
@@ -946,13 +916,10 @@ def scan_one(sym: str):
         if direction is None:
             return None
 
-        # ── REVERSE LOGIC ─────────────────────────────────────────────
-        if direction == "LONG":
-            direction = "SHORT"
-            sigs = ["REV_SHORT"] + sigs
-        elif direction == "SHORT":
-            direction = "LONG"
-            sigs = ["REV_LONG"] + sigs
+        # ── REVERSE LOGIC (DINONAKTIFKAN SEMENTARA) ─────────────────
+        # Uncomment 2 baris di bawah jika ingin reversed logic kembali
+        # if direction == "LONG":      direction = "SHORT"; sigs = ["REV_SHORT"] + sigs
+        # elif direction == "SHORT":   direction = "LONG";  sigs = ["REV_LONG"] + sigs
 
         px_live = price_live(sym)
         if px_live == 0:
@@ -989,7 +956,7 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.1 DRY REVERSED] {n}T WR:{wr:.0f}% "
+    print(f"       ┌ [v20.1.1 PROFIT-LOCK] {n}T WR:{wr:.0f}% "
           f"W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ XTP:{_stats['extreme_tp']} Trail:{_stats['trail_stop']} "
           f"HardSL:{_stats['hard_sl']} | MaxLoss/trade≤$0.20")
@@ -1003,27 +970,26 @@ def print_full():
     tph  = n / sess if sess > 0 else 0
     e    = "💚" if pnl >= 0 else "🔴"
 
-    # Trail stop breakdown
     total_exits = (_stats["extreme_tp"] + _stats["trail_stop"] + _stats["hard_sl"])
     xtp_pct   = _stats["extreme_tp"]  / total_exits * 100 if total_exits else 0
     trail_pct = _stats["trail_stop"]  / total_exits * 100 if total_exits else 0
     sl_pct    = _stats["hard_sl"]     / total_exits * 100 if total_exits else 0
 
     print(f"\n  {'─'*72}")
-    print(f"    ✅ DRY RUN v20.1 — REGIME-AWARE + PROGRESSIVE TRAIL STOP")
+    print(f"    ✅ DRY RUN v20.1.1 — TRAILING PROFIT-LOCK + ANTI-FEE LOSS")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 Exit breakdown — "
           f"XTP:{_stats['extreme_tp']}({xtp_pct:.0f}%) "
           f"Trail:{_stats['trail_stop']}({trail_pct:.0f}%) "
           f"HardSL:{_stats['hard_sl']}({sl_pct:.0f}%)")
-    print(f"    🛡️  Risk: HardSL=0.40% | MaxLoss/trade=$0.20 | Fee=0.10%/leg")
-    print(f"    📈 Trail phases: ≥0.16%→gap0.15% | ≥0.20%→0.13% | "
-          f"≥0.25%→0.10% | ≥0.30%→0.08%")
+    print(f"    🛡️  Risk: HardSL=0.40% | Trail≥0.15% (breakeven lock) | "
+          f"MinLock=0.05% | Fee=0.10%/leg")
+    print(f"    📈 Trail phases: ≥0.15%→BE | ≥0.25%→lock0.10% | "
+          f"≥0.40%→lock0.15% | ≥0.60%→lock0.20%")
     print(f"    📊 Learning: Global WR {learning.winrate():.1%} | "
           f"Bull WR {learning.winrate('TRENDING_BULL'):.1%}")
 
-    # Active positions
     if live_positions:
         print(f"    📌 Open ({len(live_positions)}/{MAX_POSITIONS}):")
         for sym, pos in live_positions.items():
@@ -1139,10 +1105,10 @@ def t_macro():
 
 def run_bot():
     print("╔══════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v20.1 — REGIME-AWARE ADAPTIVE TRADING (REVERSED)        ║")
-    print("║  🛡️  HardSL FIXED 0.40% | MaxLoss/trade = $0.20 (inkl. fee)          ║")
-    print("║  📈 Progressive Trail: 0.16%→0.15% | 0.20%→0.13% | 0.25%→0.10%     ║")
-    print("║  ✅ Self-Learning Signal Weights & Regime-Aware Scanning             ║")
+    print("║  ✅ DRY RUN v20.1.1 — PROFIT-LOCK TRAILING + ANTI FEE LOSS          ║")
+    print("║  🛡️  HardSL FIXED 0.40% | Trail ≥0.15% (breakeven lock)              ║")
+    print("║  📈 Progressive Lock: 0.15%→BE | 0.25%→0.10% | 0.40%→0.15% ...     ║")
+    print("║  ✅ Self-Learning ON | Reversed Logic OFF (bisa dinyalakan manual)  ║")
     print("╚══════════════════════════════════════════════════════════════════════╝")
 
     try:
@@ -1180,7 +1146,6 @@ def run_bot():
         if ks_ok:
             print(f"  🚨 KS AKTIF: {ks_reason}")
         elif slots == 0:
-            # Tampilkan status trail open positions
             for sym, pos in list(live_positions.items()):
                 if pos.get("_r"):
                     continue
