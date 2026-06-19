@@ -918,8 +918,8 @@ def scan_one(sym: str):
 
         # ── REVERSE LOGIC (DINONAKTIFKAN SEMENTARA) ─────────────────
         # Uncomment 2 baris di bawah jika ingin reversed logic kembali
-        # if direction == "LONG":      direction = "SHORT"; sigs = ["REV_SHORT"] + sigs
-        # elif direction == "SHORT":   direction = "LONG";  sigs = ["REV_LONG"] + sigs
+        if direction == "LONG":      direction = "SHORT"; sigs = ["REV_SHORT"] + sigs
+        elif direction == "SHORT":   direction = "LONG";  sigs = ["REV_LONG"] + sigs
 
         px_live = price_live(sym)
         if px_live == 0:
