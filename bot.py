@@ -1,18 +1,17 @@
 """
-Bot Scalping v20.1.1 — TRAILING-STOP PROFIT-LOCK + ANTI-RUGI FEE
+Bot Scalping v20.1.2 — TRAILING-STOP PROFIT-LOCK + ANTI-RUGI FEE (FIXED)
 =================================================================
-PERUBAHAN dari v20.1.0:
-1. Trailing stop sekarang MURNI untuk mengunci profit:
-   - Mulai aktif saat gross profit >= 0.15% -> stop di ENTRY (breakeven)
-   - Semakin profit naik, stop ikut naik (dari best price)
-   - Stop TIDAK PERNAH lebih rendah dari entry + sedikit margin fee
-2. MIN_PROFIT_LOCK 0.05% memastikan exit selalu > fee (net positif kecil)
-3. TRAIL_PHASES dirapihkan agar lebih lebar di awal, lebih ketat saat profit besar
-4. Reversed logic DIMATIKAN sementara — silakan nyalakan jika ingin
-5. MIN_SCORE dinaikkan ke 60 (range/volatile) dan 55 (trending)
-6. Kill Switch daily loss dikecilkan ke -8U agar lebih protektif
+PERUBAHAN dari v20.1.1:
+1. HardSL dinaikkan ke 0.50% supaya posisi tidak sering tersentil.
+2. ExtremeTP dinaikkan ke 2.00% untuk menangkap momentum besar sesekali.
+3. MIN_PROFIT_LOCK dinaikkan ke 0.30% → minimal net profit +0.10% setelah fee.
+4. TRAIL_PHASES disusun ulang:
+   - Aktif mulai 0.40% gross profit → net minimal +0.10%
+   - Gap diperbesar agar lebih banyak profit terkunci.
+5. Reversed Logic **dinonaktifkan** agar mengikuti sinyal asli.
+6. MIN_SCORE tetap sama, Kill Switch daily loss tetap -8U.
 
-Target: WR > 40%, Profit Factor > 1.2, Max Drawdown < -5U
+Target: WR > 35%, Profit Factor > 1.2, Net PnL positif stabil.
 """
 
 import os
@@ -45,8 +44,8 @@ ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
 
 # ── Risk Management (FIXED PCT) ─────────────────────────────────────────
-HARD_SL_PCT       = 0.004    # 0.40% price move → max loss ~$0.16
-EXTREME_TP_PCT    = 0.015    # 1.50% backstop TP
+HARD_SL_PCT       = 0.005    # 0.50% price move → max loss ~$0.20
+EXTREME_TP_PCT    = 0.020    # 2.00% backstop TP
 FEE_RATE          = 0.001    # 0.10% per leg
 
 # ── Progressive Trailing Stop (PROFIT-LOCK ONLY) ──────────────────────
@@ -54,15 +53,15 @@ FEE_RATE          = 0.001    # 0.10% per leg
 # gap = jarak stop dari BEST PRICE (bukan dari entry)
 # STOP TIDAK AKAN PERNAH LEBIH RENDAH DARI ENTRY + MIN_PROFIT_LOCK
 TRAIL_PHASES = [
-    (0.0060, 0.0040),   # profit >= 0.60% → gap 0.40% (net stop ≈ +0.20%)
-    (0.0040, 0.0025),   # profit >= 0.40% → gap 0.25% (net stop ≈ +0.15%)
-    (0.0025, 0.0015),   # profit >= 0.25% → gap 0.15% (net stop ≈ +0.10%)
-    (0.0015, 0.0015),   # profit >= 0.15% → gap 0.15% (net stop ≈ +0.00% = breakeven)
+    (0.010, 0.005),   # profit >= 1.00% → gap 0.50% (net lock ≈ +0.30%)
+    (0.006, 0.004),   # profit >= 0.60% → gap 0.40% (net lock ≈ +0.20%)
+    (0.0045, 0.0035), # profit >= 0.45% → gap 0.35% (net lock ≈ +0.10%)
+    (0.004, 0.003),   # profit >= 0.40% → gap 0.30% (net lock ≈ +0.10%)
 ]
 # TRAIL_PHASES harus diurutkan dari threshold TERBESAR ke TERKECIL
 
 # ── Minimal profit lock setelah trailing aktif ───────────────────────
-MIN_PROFIT_LOCK = 0.0005   # 0.05% di atas entry agar nutup fee (net ≈ +0.03% setelah fee)
+MIN_PROFIT_LOCK = 0.003   # 0.30% di atas entry agar net +0.10% setelah fee
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -746,7 +745,7 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     print(f"\n  {d} [DRY] {sym} {direction} @{price:.6g} "
           f"| HardSL:{sl_pct*100:.2f}% XTP:{tp_pct*100:.2f}% "
           f"| Regime:{regime}")
-    print(f"        Trail aktif ≥0.15% gross (breakeven lock) | Signals: {' | '.join(sigs[:5])}")
+    print(f"        Trail aktif ≥0.40% gross (min net +0.10%) | Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
 
@@ -916,10 +915,9 @@ def scan_one(sym: str):
         if direction is None:
             return None
 
-        # ── REVERSE LOGIC (DINONAKTIFKAN SEMENTARA) ─────────────────
-        # Uncomment 2 baris di bawah jika ingin reversed logic kembali
-        if direction == "LONG":      direction = "SHORT"; sigs = ["REV_SHORT"] + sigs
-        elif direction == "SHORT":   direction = "LONG";  sigs = ["REV_LONG"] + sigs
+        # ── REVERSE LOGIC (DINONAKTIFKAN) ───────────────────────────
+        # if direction == "LONG":      direction = "SHORT"; sigs = ["REV_SHORT"] + sigs
+        # elif direction == "SHORT":   direction = "LONG";  sigs = ["REV_LONG"] + sigs
 
         px_live = price_live(sym)
         if px_live == 0:
@@ -956,10 +954,10 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.1.1 PROFIT-LOCK] {n}T WR:{wr:.0f}% "
+    print(f"       ┌ [v20.1.2 PROFIT-LOCK FIX] {n}T WR:{wr:.0f}% "
           f"W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ XTP:{_stats['extreme_tp']} Trail:{_stats['trail_stop']} "
-          f"HardSL:{_stats['hard_sl']} | MaxLoss/trade≤$0.20")
+          f"HardSL:{_stats['hard_sl']} | HardSL=0.50% Trail≥0.40%")
 
 
 def print_full():
@@ -976,17 +974,17 @@ def print_full():
     sl_pct    = _stats["hard_sl"]     / total_exits * 100 if total_exits else 0
 
     print(f"\n  {'─'*72}")
-    print(f"    ✅ DRY RUN v20.1.1 — TRAILING PROFIT-LOCK + ANTI-FEE LOSS")
+    print(f"    ✅ DRY RUN v20.1.2 — TRAILING PROFIT-LOCK FIXED + ANTI-FEE")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 Exit breakdown — "
           f"XTP:{_stats['extreme_tp']}({xtp_pct:.0f}%) "
           f"Trail:{_stats['trail_stop']}({trail_pct:.0f}%) "
           f"HardSL:{_stats['hard_sl']}({sl_pct:.0f}%)")
-    print(f"    🛡️  Risk: HardSL=0.40% | Trail≥0.15% (breakeven lock) | "
-          f"MinLock=0.05% | Fee=0.10%/leg")
-    print(f"    📈 Trail phases: ≥0.15%→BE | ≥0.25%→lock0.10% | "
-          f"≥0.40%→lock0.15% | ≥0.60%→lock0.20%")
+    print(f"    🛡️  Risk: HardSL=0.50% | Trail≥0.40% (net +0.10%) | "
+          f"MinLock=0.30% | Fee=0.10%/leg")
+    print(f"    📈 Trail phases: 0.40%→+0.10% | 0.45%→+0.10% | "
+          f"0.60%→+0.20% | 1.00%→+0.30%")
     print(f"    📊 Learning: Global WR {learning.winrate():.1%} | "
           f"Bull WR {learning.winrate('TRENDING_BULL'):.1%}")
 
@@ -1105,10 +1103,10 @@ def t_macro():
 
 def run_bot():
     print("╔══════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v20.1.1 — PROFIT-LOCK TRAILING + ANTI FEE LOSS          ║")
-    print("║  🛡️  HardSL FIXED 0.40% | Trail ≥0.15% (breakeven lock)              ║")
-    print("║  📈 Progressive Lock: 0.15%→BE | 0.25%→0.10% | 0.40%→0.15% ...     ║")
-    print("║  ✅ Self-Learning ON | Reversed Logic OFF (bisa dinyalakan manual)  ║")
+    print("║  ✅ DRY RUN v20.1.2 — PROFIT-LOCK TRAILING FIXED + ANTI FEE LOSS    ║")
+    print("║  🛡️  HardSL FIXED 0.50% | Trail ≥0.40% (net +0.10%)                 ║")
+    print("║  📈 Progressive Lock: 0.40→+0.10 | 0.45→+0.10 | 0.60→+0.20 | 1.0→+0.30")
+    print("║  ✅ Self-Learning ON | Reversed Logic OFF (sinyal asli)              ║")
     print("╚══════════════════════════════════════════════════════════════════════╝")
 
     try:
