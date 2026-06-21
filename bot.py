@@ -1,10 +1,10 @@
 """
-Bot Scalping v20.2 — REVERSED LOGIC (CONTRARIAN)
+Bot Scalping v20.3 — REVERSED LOGIC (CONTRARIAN)
 =================================================
 - Entry direction inverted (LONG <-> SHORT)
-- SL = TP = 0.5% fixed dari entry (simetris)
-- Trailing Stop aktif saat profit >= 1%, gap 0.15%, step 0.3%
-- Trail hanya protect profit, Hard SL tetap jalan paralel
+- Hard SL = 0.4% (Max net loss 0.5% incl. 0.1% fee)
+- Hard TP = 0.6% (Max net profit 0.5% incl. 0.1% fee)
+- Trailing Stop DIHAPUS.
 """
 
 import os
@@ -35,17 +35,12 @@ LEVERAGE     = 20
 ORDER_USDT   = 2.0
 MAX_POSITIONS = 3
 
-# ── Risk: SL dan TP simetris fixed ─────────────────────────────────────
-SL_PCT = 0.005   # 0.5% Hard Stop Loss dari entry
-TP_PCT = 0.005   # 0.5% Take Profit dari entry
-
-# ── Trailing Stop ───────────────────────────────────────────────────────
-TRAIL_ACTIVATE_PCT = 0.010   # 1.0%  — trail mulai aktif
-TRAIL_GAP_PCT      = 0.0015  # 0.15% — jarak trail dari peak profit
-TRAIL_STEP_PCT     = 0.003   # 0.3%  — log step (informatif)
+# ── Risk: SL dan TP murni (Kompensasi Fee 0.1% Total) ───────────────────
+SL_PCT = 0.004   # Pergerakan harga 0.4% + Fee 0.1% = 0.5% Total Loss (Max)
+TP_PCT = 0.006   # Pergerakan harga 0.6% - Fee 0.1% = 0.5% Total Profit
 
 # ── ATR masih dipakai untuk scoring, BUKAN untuk SL/TP ─────────────────
-ATR_MULT_SL = 1.2   # (unused untuk SL/TP, dipertahankan untuk kompatibilitas scoring)
+ATR_MULT_SL = 1.2
 ATR_MULT_TP = 2.5
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -389,7 +384,7 @@ class SignalScorer:
         if   m5 < -0.003: w = self.weights.get_adjusted_weight("mom_strong_neg");   score += w; signals.append(f"Mom{m5*100:.1f}%↓[{w:.0f}]")
         elif m5 < -0.002: w = self.weights.get_adjusted_weight("mom_moderate_neg"); score += w; signals.append(f"Mom{m5*100:.1f}%↓[{w:.0f}]")
         mh, mh_p, mh_p2 = row["mh"], prev["mh"], prev2["mh"]
-        if   mh_p >= 0 and mh < 0:           w = self.weights.get_adjusted_weight("macd_cross_down");    score += w; signals.append(f"MACD_X↓[{w:.0f}]")
+        if   mh_p >= 0 and mh < 0:            w = self.weights.get_adjusted_weight("macd_cross_down");    score += w; signals.append(f"MACD_X↓[{w:.0f}]")
         elif mh < 0 and mh < mh_p < mh_p2:   w = self.weights.get_adjusted_weight("macd_strengthen_neg"); score += w; signals.append(f"MACD↓↓[{w:.0f}]")
         br = row["br"]
         if   br < 0.44: w = self.weights.get_adjusted_weight("orderflow_sell_climax"); score += w; signals.append(f"SellClimax{1-br:.0%}[{w:.0f}]")
@@ -496,7 +491,7 @@ _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "trail_sl": 0, "force": 0,
+    "extreme_tp": 0, "hard_sl": 0, "force": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -624,10 +619,7 @@ learning       = LearningLayer(signal_weights)
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
     """
-    Buka posisi dengan logika kebalikan:
-      - orig_direction LONG  → buka SHORT, SL = +0.5%, TP = -0.5%
-      - orig_direction SHORT → buka LONG,  SL = -0.5%, TP = +0.5%
-    SL dan TP simetris fixed 0.5%, tidak pakai ATR.
+    Buka posisi dengan logika kebalikan (Contrarian).
     """
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
@@ -648,7 +640,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         with _lock: live_positions.pop(sym, None)
         return
 
-    # ── Hitung SL dan TP fixed 0.5% ─────────────────────────────────────
+    # ── Hitung SL dan TP murni ──────────────────────────────────────────
     if orig_direction == "LONG":
         actual_side = "SHORT"
         sl_price    = price * (1 + SL_PCT)   # SL di atas entry untuk SHORT
@@ -673,16 +665,12 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         "regime":         regime,
         "bias":           bias,
         "orig_direction": orig_direction,
-        # ── Trailing Stop state ──────────────────────────────────────────
-        "trail_sl_price":  None,   # None = belum aktif
-        "peak_profit_pct": 0.0,    # profit % tertinggi yang pernah dicapai
     }
     with _lock: live_positions[sym] = pos
 
     d = "🟢" if actual_side == "LONG" else "🔴"
-    print(f"\n  {d} [v20.2] {sym} {actual_side} (orig:{orig_direction}) @{price:.6g}")
-    print(f"       SL:{SL_PCT*100:.1f}% ({sl_price:.6g}) | TP:{TP_PCT*100:.1f}% ({tp_price:.6g}) | Regime:{regime}")
-    print(f"       Trail: aktif saat profit >= {TRAIL_ACTIVATE_PCT*100:.1f}%, gap {TRAIL_GAP_PCT*100:.2f}%")
+    print(f"\n  {d} [v20.3] {sym} {actual_side} (orig:{orig_direction}) @{price:.6g}")
+    print(f"       SL:{SL_PCT*100:.2f}% ({sl_price:.6g}) | TP:{TP_PCT*100:.2f}% ({tp_price:.6g}) | Regime:{regime}")
     print(f"       Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
@@ -705,8 +693,7 @@ def live_close(sym, reason, price=None):
     won       = pnl >= 0
     e         = "🟢" if won else "🔴"
 
-    peak_info = f" [peak:{pos['peak_profit_pct']*100:.2f}%]" if pos["peak_profit_pct"] > 0 else ""
-    print(f"  {e} [v20.2] {sym} {side} CLOSE — {reason}{peak_info}")
+    print(f"  {e} [v20.3] {sym} {side} CLOSE — {reason}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -729,7 +716,6 @@ def live_close(sym, reason, price=None):
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
     if "ExtremeTP" in reason:  _stats["extreme_tp"] += 1
-    elif "TrailSL" in reason:  _stats["trail_sl"]   += 1
     elif "HardSL"  in reason:  _stats["hard_sl"]    += 1
 
     trade_log.append({
@@ -741,71 +727,9 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 
-def _update_trailing_stop(sym: str, pos: dict, px: float) -> Optional[float]:
-    """
-    Update trailing stop. Aturan:
-    - Hitung profit_pct sekarang dari entry.
-    - Update peak_profit_pct jika profit naik.
-    - Trail aktif jika peak >= TRAIL_ACTIVATE_PCT (1.0%).
-    - Floor trail = peak - TRAIL_GAP_PCT (0.15%), minimal 0 (tidak di bawah entry).
-    - Trail hanya naik (untuk LONG) / turun (untuk SHORT) — ratchet.
-    - Trail TIDAK menggantikan Hard SL.
-    Return: trail_sl_price aktif, atau None jika belum aktif.
-    """
-    side  = pos["side"]
-    entry = pos["entry"]
-
-    profit_pct = (px - entry) / entry if side == "LONG" else (entry - px) / entry
-
-    # Belum di profit sama sekali
-    if profit_pct <= 0:
-        return pos.get("trail_sl_price")
-
-    # Update peak
-    if profit_pct > pos["peak_profit_pct"]:
-        pos["peak_profit_pct"] = profit_pct
-
-    peak = pos["peak_profit_pct"]
-
-    # Trail belum aktif
-    if peak < TRAIL_ACTIVATE_PCT:
-        return None
-
-    # Hitung floor trail: peak − gap, minimal 0 (floor tidak di bawah entry)
-    floor_pct = max(0.0, peak - TRAIL_GAP_PCT)
-
-    if side == "LONG":
-        new_trail = entry * (1.0 + floor_pct)
-    else:
-        new_trail = entry * (1.0 - floor_pct)
-
-    old_trail = pos.get("trail_sl_price")
-
-    if old_trail is None:
-        # Pertama kali trail aktif
-        pos["trail_sl_price"] = new_trail
-        print(f"    🔒 TrailSL AKTIF {sym} {side}: floor={floor_pct*100:.2f}% "
-              f"| trail@{new_trail:.6g} (peak={peak*100:.2f}%)")
-    else:
-        # Ratchet: hanya perbarui jika trail makin ketat
-        if side == "LONG" and new_trail > old_trail:
-            pos["trail_sl_price"] = new_trail
-            print(f"    ↗️  TrailSL ↑ {sym}: {old_trail:.6g}→{new_trail:.6g} "
-                  f"(floor={floor_pct*100:.2f}%, peak={peak*100:.2f}%)")
-        elif side == "SHORT" and new_trail < old_trail:
-            pos["trail_sl_price"] = new_trail
-            print(f"    ↘️  TrailSL ↓ {sym}: {old_trail:.6g}→{new_trail:.6g} "
-                  f"(floor={floor_pct*100:.2f}%, peak={peak*100:.2f}%)")
-
-    return pos["trail_sl_price"]
-
-
 def monitor_positions():
     """
-    Urutan pengecekan per posisi:
-    1. Hard SL  — fixed 0.5%, tidak berubah
-    2. ExtremeTP — fixed 0.5%
-    3. Trailing Stop — aktif setelah profit >= 1%, melindungi profit
+    Pengecekan per posisi murni Hard SL dan Take Profit.
     """
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
@@ -826,21 +750,13 @@ def monitor_positions():
             if px >= sl_px:
                 live_close(sym, "HardSL", px); continue
 
-        # ── 2. ExtremeTP ────────────────────────────────────────────────
+        # ── 2. Take Profit ──────────────────────────────────────────────
         if side == "LONG":
             if px >= tp_px:
                 live_close(sym, "ExtremeTP", px); continue
         else:
             if px <= tp_px:
                 live_close(sym, "ExtremeTP", px); continue
-
-        # ── 3. Trailing Stop ────────────────────────────────────────────
-        trail_price = _update_trailing_stop(sym, pos, px)
-        if trail_price is not None:
-            if side == "LONG" and px <= trail_price:
-                live_close(sym, f"TrailSL@{trail_price:.6g}", px); continue
-            elif side == "SHORT" and px >= trail_price:
-                live_close(sym, f"TrailSL@{trail_price:.6g}", px); continue
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -891,8 +807,8 @@ def print_inline():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     e   = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [v20.2] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"       └ ExTP:{_stats['extreme_tp']} TrailSL:{_stats['trail_sl']} HardSL:{_stats['hard_sl']}")
+    print(f"       ┌ [v20.3] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -902,12 +818,11 @@ def print_full():
     tph  = n / sess if sess > 0 else 0
     e    = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*72}")
-    print(f"    ✅ REVERSED LOGIC v20.2 — FIXED SL/TP + TRAILING STOP")
+    print(f"    ✅ REVERSED LOGIC v20.3 — PURE SL/TP ONLY")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    💰 ExtremeTP:{_stats['extreme_tp']} TrailSL:{_stats['trail_sl']} HardSL:{_stats['hard_sl']}")
-    print(f"    ⚙️  SL={SL_PCT*100:.1f}% (fixed) | TP={TP_PCT*100:.1f}% (fixed) | Simetris")
-    print(f"    🔒 Trail: aktif@{TRAIL_ACTIVATE_PCT*100:.1f}% profit | gap {TRAIL_GAP_PCT*100:.2f}% | step {TRAIL_STEP_PCT*100:.1f}%")
+    print(f"    💰 TP:{_stats['extreme_tp']} | SL:{_stats['hard_sl']}")
+    print(f"    ⚙️  SL={SL_PCT*100:.2f}% | TP={TP_PCT*100:.2f}% (Sudah termasuk toleransi fee 0.1%)")
     print(f"    📊 Learning WR: {learning.get_global_winrate():.1%} | BTC:{_macro['btc']}")
     if trade_log:
         print(f"    📋 Last 5 trades:")
@@ -990,10 +905,10 @@ def t_macro():
 
 def run_bot():
     print("╔══════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ REVERSED LOGIC v20.2 — FIXED SL/TP + TRAILING STOP            ║")
-    print(f"║  ✅ SL = TP = {SL_PCT*100:.1f}% fixed simetris dari entry                    ║")
-    print(f"║  ✅ Trailing Stop aktif saat profit >= {TRAIL_ACTIVATE_PCT*100:.1f}%                    ║")
-    print(f"║  ✅ Trail gap {TRAIL_GAP_PCT*100:.2f}% | ratchet, hanya protect profit           ║")
+    print("║  ✅ REVERSED LOGIC v20.3 — PURE SL/TP ONLY                           ║")
+    print("║  ✅ Trailing Stop dihapus.                                           ║")
+    print("║  ✅ Hard SL 0.4% (Max net loss 0.5% inc. fee 0.1%)                   ║")
+    print("║  ✅ Target TP 0.6% (Max net profit 0.5% inc. fee 0.1%)               ║")
     print("╚══════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
