@@ -1,8 +1,9 @@
 """
-Bot Scalping v20.2 — REVERSED LOGIC (CONTRARIAN) + STRICT RISK
+Bot Scalping v20.3 — NORMAL LOGIC (SWAPPED FROM LOSS) + STRICT RISK
 ====================================================
-- Entry direction inverted (LONG <-> SHORT)
-- Strict Take Profit 0.5% & Stop Loss 0.5% (No Trailing / ATR bullshit)
+- Entry direction NORMAL (LONG = LONG, SHORT = SHORT)
+- Membalikkan bot sebelumnya: SL lama menjadi TP baru, TP lama menjadi SL baru
+- Strict Take Profit 0.5% & Stop Loss 0.5% 
 - Ultra-fast real-time monitoring anti-jebol
 """
 
@@ -183,7 +184,6 @@ class SignalScorer:
         
         atr = df["atr"].iloc[-2]
         
-        # Sederhanakan filter, langsung berikan arah murni berdasarkan skor
         if long_score >= MIN_SCORE and long_score > short_score:
             return "LONG", long_score, long_signals, atr, regime, bias
         elif short_score >= MIN_SCORE and short_score > long_score:
@@ -253,7 +253,7 @@ class SignalScorer:
 class RiskManager:
     @staticmethod
     def calculate_sl_tp(entry_price: float, direction: str) -> Tuple[float, float, float, float]:
-        # Dibuat FIX 0.5% dari harga entry. Tidak peduli ATR atau volatilitas.
+        # Dibuat FIX 0.5% dari harga entry.
         sl_distance = entry_price * FIXED_SL_PCT
         tp_distance = entry_price * FIXED_TP_PCT
         
@@ -356,7 +356,6 @@ def price_live(symbol):
     except: return 0.0
 
 def get_all_prices():
-    # Menggunakan endpoint weight yang sangat ringan (Weight: 2) untuk scan instan!
     try:
         raw = client.futures_symbol_ticker()
         return {t["symbol"]: float(t["price"]) for t in raw}
@@ -366,7 +365,6 @@ def get_all_prices():
 def tickers_all():
     global _ticker_cache, _ticker_ts
     now = time.time()
-    # Cache hanya 0.5 detik untuk ngeringanin API, gak selama 2 detik lagi!
     if now - _ticker_ts < 0.5 and _ticker_cache: return _ticker_cache
     try:
         raw = client.futures_ticker()
@@ -462,10 +460,11 @@ def live_open(orig_direction, score, sigs, price, regime, bias, sym):
         with _lock: live_positions.pop(sym, None)
         return
     
-    # REVERSED LOGIC DI SINI
-    actual_side = "SHORT" if orig_direction == "LONG" else "LONG"
+    # PERUBAHAN UTAMA: 
+    # Kembali ke arah NORMAL (sehingga kebalikan dari posisi bot lu yang sering kena loss).
+    # Dengan membalikkan arah, yang sebelumnya nabrak SL sekarang bakal nyentuh TP.
+    actual_side = orig_direction 
     
-    # Hitung SL & TP strictly dari 0.5% (Tidak peduli kebalikan atau nggak, math-nya sama)
     sl_price, tp_price, sl_pct, tp_pct = RiskManager.calculate_sl_tp(price, actual_side)
     
     pos = {
@@ -486,8 +485,8 @@ def live_open(orig_direction, score, sigs, price, regime, bias, sym):
     with _lock: live_positions[sym] = pos
     
     d = "🟢" if actual_side == "LONG" else "🔴"
-    print(f"\n  {d} [REVERSED] {sym} {actual_side} (orig {orig_direction}) @{price:.6g} | SL:{sl_pct*100:.1f}% TP:{tp_pct*100:.1f}%")
-    print(f"        Original signals: {' | '.join(sigs[:5])}")
+    print(f"\n  {d} [NORMAL/SWAPPED] {sym} {actual_side} @{price:.6g} | SL:{sl_pct*100:.1f}% TP:{tp_pct*100:.1f}%")
+    print(f"        Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
 def live_close(sym, reason, price=None):
@@ -508,7 +507,7 @@ def live_close(sym, reason, price=None):
     won = pnl >= 0
     e = "🟢" if won else "🔴"
     
-    print(f"  {e} [REVERSED] {sym} {side} CLOSE — {reason}")
+    print(f"  {e} [NORMAL/SWAPPED] {sym} {side} CLOSE — {reason}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
     
     trade = TradeRecord(
@@ -541,7 +540,6 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 def monitor_positions():
-    # Tarik semua harga dalam 1x request super enteng (weight: 2) -> eksekusi gak akan telat!
     prices = get_all_prices()
     if not prices: return
     
@@ -612,7 +610,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.2 FIX] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       ┌ [v20.3 SWAPPED] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
@@ -623,12 +621,12 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ REVERSED LOGIC v20.2 — STRICT 0.5% SL/TP")
+    print(f"    ✅ NORMAL LOGIC v20.3 — (LOSS TO PROFIT REVERSAL)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  Logic Reversed | 0.5% Strict Mode | Fast Polling Active")
+    print(f"    ⚙️  Logic NORMAL (Swapped from previous loss) | 0.5% Strict | Fast Polling")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -646,7 +644,7 @@ def t_monitor():
             if live_positions:
                 monitor_positions()
         except: pass
-        time.sleep(MONITOR_INT) # Jauh lebih cepat (0.2s)
+        time.sleep(MONITOR_INT) 
 
 def t_slot_filler(syms):
     scan_idx = 0
@@ -711,9 +709,9 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ REVERSED LOGIC v20.2 — STRICT TP & SL FIX                      ║")
-    print("║  ✅ Entry dibalik (LONG<->SHORT)                                   ║")
-    print("║  ✅ STRICT SL/TP 0.5% (Total Nett: TP 0.4% & SL 0.6% pasca fee)    ║")
+    print("║  ✅ NORMAL LOGIC v20.3 — LOSS TO PROFIT SWAP                       ║")
+    print("║  ✅ Entry NORMAL (Merespon kebalikan dari loss di versi v20.2)     ║")
+    print("║  ✅ SL lama otomatis jadi titik TP, TP lama otomatis jadi titik SL ║")
     print("║  ✅ Real-time Polling (Anti-Jebol System Active)                   ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
@@ -739,7 +737,7 @@ def run_bot():
         elif slots == 0:
             print(f"  ✅ Slots full")
         else:
-            print(f"  🔍 {slots} slot kosong — Adaptive scanning (REVERSED)...")
+            print(f"  🔍 {slots} slot kosong — Adaptive scanning (NORMAL)...")
         if cycle % 30 == 0:
             print_full()
         time.sleep(SCAN_INTERVAL)
