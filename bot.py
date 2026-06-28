@@ -35,7 +35,7 @@ ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
 # Risk Management (DITUKAR SESUAI PERINTAH)
-FIXED_SL_PCT = 0.007  # Stop Loss jadi 0.7%
+FIXED_SL_PCT = 0.006  # Stop Loss jadi 0.7%
 FIXED_TP_PCT = 0.004  # Take Profit jadi 0.4%
 
 # ═══════════════════════════════════════════════════════════════════════════
