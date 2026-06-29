@@ -1,8 +1,9 @@
 """
-Bot Scalping v20.4 — ORIGINAL LOGIC + SWAPPED RISK
+Bot Scalping v20.5 — ORIGINAL LOGIC + MATHEMATICAL RR + TIME STOP
 ====================================================
-- Entry direction reverted to ORIGINAL (LONG = LONG, SHORT = SHORT)
-- TP and SL Swapped: Take Profit 0.4% & Stop Loss 0.7%
+- Entry direction ORIGINAL (LONG = LONG, SHORT = SHORT)
+- TP 0.8% & SL 0.6% (1:1 Risk Reward AFTER 0.1% Fees)
+- Time Stop: Auto close if trade > 20 minutes
 - Ultra-fast real-time monitoring anti-jebol
 """
 
@@ -34,9 +35,12 @@ LEVERAGE = 20
 ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
-# Risk Management (DITUKAR SESUAI PERINTAH)
-FIXED_SL_PCT = 0.006  # Stop Loss jadi 0.7%
-FIXED_TP_PCT = 0.004  # Take Profit jadi 0.4%
+# Risk Management (MATEMATIS PROFITABLE DENGAN WR 61%)
+FIXED_TP_PCT = 0.008  # Take Profit 0.8% (Net +0.7% setelah fee)
+FIXED_SL_PCT = 0.006  # Stop Loss 0.6% (Net -0.7% setelah fee)
+
+# Time Management
+MAX_HOLD_SECONDS = 1200  # Maksimal tahan posisi 20 menit (1.200 detik)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -55,7 +59,7 @@ SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
 # Scanning & Monitoring
 SCAN_INTERVAL = 2.0
-MONITOR_INT = 0.2  # Dipercepat jadi 0.2 detik biar real-time dan nggak jebol
+MONITOR_INT = 0.2  # Real-time
 BATCH_SIZE = 15
 MAX_WORKERS = 5
 SLOT_FILL_INT = 0.01
@@ -183,7 +187,6 @@ class SignalScorer:
         
         atr = df["atr"].iloc[-2]
         
-        # Sederhanakan filter, langsung berikan arah murni berdasarkan skor
         if long_score >= MIN_SCORE and long_score > short_score:
             return "LONG", long_score, long_signals, atr, regime, bias
         elif short_score >= MIN_SCORE and short_score > long_score:
@@ -247,7 +250,7 @@ class SignalScorer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER (STRICT FIXED PERCENTAGE)
+#  RISK MANAGER
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
@@ -283,7 +286,6 @@ class TradeRecord:
     hold_seconds: float
     timestamp: float = field(default_factory=time.time)
 
-
 class LearningLayer:
     def __init__(self, signal_weights: SignalWeights):
         self.signal_weights = signal_weights
@@ -311,7 +313,6 @@ class LearningLayer:
         total = total_wins + total_losses
         return total_wins / total if total > 0 else 0.5
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  BOT STATE & UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
@@ -329,7 +330,7 @@ _macro = {"btc": "UNKNOWN"}
 _ks = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0,
+    "extreme_tp": 0, "hard_sl": 0, "time_stop": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -426,16 +427,6 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TRADING STATE
-# ═══════════════════════════════════════════════════════════════════════════
-
-live_positions = {}
-trade_log = []
-signal_weights = SignalWeights()
-scorer = SignalScorer(signal_weights)
-learning = LearningLayer(signal_weights)
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  CORE TRADING FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -459,9 +450,7 @@ def live_open(orig_direction, score, sigs, price, regime, bias, sym):
         with _lock: live_positions.pop(sym, None)
         return
     
-    # DIKEMBALIKAN KE LOGIKA ASLI (TIDAK DIBALIK)
     actual_side = orig_direction
-    
     sl_price, tp_price, sl_pct, tp_pct = RiskManager.calculate_sl_tp(price, actual_side)
     
     pos = {
@@ -527,6 +516,7 @@ def live_close(sym, reason, price=None):
     
     if "TP" in reason: _stats["extreme_tp"] += 1
     elif "SL" in reason: _stats["hard_sl"] += 1
+    elif "Time" in reason: _stats["time_stop"] += 1
     
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -540,6 +530,8 @@ def monitor_positions():
     prices = get_all_prices()
     if not prices: return
     
+    current_time = time.time()
+    
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
         if pos is None or pos.get("_r"): continue
@@ -550,7 +542,13 @@ def monitor_positions():
         side = pos["side"]
         sl_px = pos["sl_price"]
         tp_px = pos["tp_price"]
+        hold_time = current_time - pos["open_time"]
         
+        # LOGIKA TIME-STOP (Batas Maksimal Tahan Posisi)
+        if hold_time > MAX_HOLD_SECONDS:
+            live_close(sym, "TimeStop", px)
+            continue
+            
         if side == "LONG":
             if px <= sl_px:
                 live_close(sym, "HardSL", px); continue
@@ -607,8 +605,8 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.4 ORIGINAL] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
+    print(f"       ┌ [v20.5 OPTIMIZED] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} TimeOut:{_stats['time_stop']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -618,12 +616,12 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ NORMAL LOGIC v20.4 — SWAPPED TP/SL RISK")
+    print(f"    ✅ NORMAL LOGIC v20.5 — MATH RR + TIME STOP")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    💰 TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']}")
+    print(f"    💰 TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} Timeout:{_stats['time_stop']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  Original Direction | TP 0.4% & SL 0.7% | Fast Polling")
+    print(f"    ⚙️  Original Direction | TP 0.8% & SL 0.6% | Max Hold: 20m")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -706,10 +704,10 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ NORMAL LOGIC v20.4 — SWAPPED TP & SL RISK                      ║")
-    print("║  ✅ Entry KEMBALI KE ASLI (LONG -> LONG, SHORT -> SHORT)           ║")
-    print("║  ✅ STRICT POSITIVE WINRATE RELIANCE (TP 0.4% | SL 0.7%)           ║")
-    print("║  ✅ Fast Polling Anti-Jebol Active                                 ║")
+    print("║  ✅ NORMAL LOGIC v20.5 — MATH EXPECTANCY & TIME STOP FIXED         ║")
+    print("║  ✅ Entry Asli (LONG = LONG, SHORT = SHORT)                        ║")
+    print("║  ✅ RR 1:1 (TP 0.8%, SL 0.6%) -> Cukup Win Rate 50% untuk Profit   ║")
+    print("║  ✅ Time Stop Active: Tutup posisi otomatis jika > 20 menit        ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
