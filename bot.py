@@ -1,5 +1,5 @@
 """
-Bot Scalping v20.5 — ORIGINAL LOGIC + MATHEMATICAL RR + TIME STOP
+Bot Scalping v20.5.1 — ORIGINAL LOGIC + MATHEMATICAL RR + TIME STOP
 ====================================================
 - Entry direction ORIGINAL (LONG = LONG, SHORT = SHORT)
 - TP 0.8% & SL 0.6% (1:1 Risk Reward AFTER 0.1% Fees)
@@ -268,6 +268,7 @@ class RiskManager:
             
         return sl_price, tp_price, FIXED_SL_PCT, FIXED_TP_PCT
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  TRADE RECORDER & LEARNING LAYER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -313,8 +314,9 @@ class LearningLayer:
         total = total_wins + total_losses
         return total_wins / total if total > 0 else 0.5
 
+
 # ═══════════════════════════════════════════════════════════════════════════
-#  BOT STATE & UTILITIES
+#  TRADING STATE & UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
 
 _precision_cache = {}
@@ -333,6 +335,14 @@ _stats = {
     "extreme_tp": 0, "hard_sl": 0, "time_stop": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
+
+# BLOK YANG TADI HILANG SUDAH DIKEMBALIKAN DI SINI ✅
+live_positions = {}
+trade_log = []
+signal_weights = SignalWeights()
+scorer = SignalScorer(signal_weights)
+learning = LearningLayer(signal_weights)
+
 
 def get_precision(symbol):
     if symbol in _precision_cache: return _precision_cache[symbol]
@@ -605,7 +615,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.5 OPTIMIZED] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       ┌ [v20.5.1 OPTIMIZED] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} TimeOut:{_stats['time_stop']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
@@ -616,7 +626,7 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ NORMAL LOGIC v20.5 — MATH RR + TIME STOP")
+    print(f"    ✅ NORMAL LOGIC v20.5.1 — MATH RR + TIME STOP")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} Timeout:{_stats['time_stop']}")
@@ -704,7 +714,7 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ NORMAL LOGIC v20.5 — MATH EXPECTANCY & TIME STOP FIXED         ║")
+    print("║  ✅ NORMAL LOGIC v20.5.1 — MATH EXPECTANCY & TIME STOP FIXED       ║")
     print("║  ✅ Entry Asli (LONG = LONG, SHORT = SHORT)                        ║")
     print("║  ✅ RR 1:1 (TP 0.8%, SL 0.6%) -> Cukup Win Rate 50% untuk Profit   ║")
     print("║  ✅ Time Stop Active: Tutup posisi otomatis jika > 20 menit        ║")
