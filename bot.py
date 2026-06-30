@@ -1,10 +1,23 @@
 """
-Bot Scalping v20.5.1 — ORIGINAL LOGIC + MATHEMATICAL RR + TIME STOP
+Bot Scalping v20.5 — FIXED RISK RATIO + ATR-ADAPTIVE OPTION
 ====================================================
-- Entry direction ORIGINAL (LONG = LONG, SHORT = SHORT)
-- TP 0.8% & SL 0.6% (1:1 Risk Reward AFTER 0.1% Fees)
-- Time Stop: Auto close if trade > 20 minutes
-- Ultra-fast real-time monitoring anti-jebol
+PERUBAHAN DARI v20.4:
+1. TP/SL RASIO DIBALIK: TP sekarang lebih besar dari SL (bukan sebaliknya).
+   v20.4 punya TP 0.4% / SL 0.7% -> breakeven winrate ~73% setelah fee,
+   padahal winrate real cuma ~61%, jadi MATEMATIKANYA pasti minus walau
+   menang lebih banyak trade.
+2. Fee dihitung eksplisit ke breakeven formula, jadi kelihatan jelas
+   target winrate yang harus dicapai SEBELUM live/lebih banyak modal.
+3. Opsi SL/TP berbasis ATR (USE_ATR_RISK) supaya risk menyesuaikan
+   volatilitas tiap simbol, bukan persentase tetap yang sama buat
+   BTC dan token kecil yang volatilitasnya beda jauh.
+4. Live breakeven-winrate monitor ditambahkan ke print_inline/print_full
+   supaya kamu bisa lihat real-time apakah winrate aktual ada di atas
+   atau di bawah ambang impas.
+
+CATATAN: ini tetap di testnet. Sebelum mikirin live/modal asli,
+jalankan dulu cukup lama (ratusan-ribuan trade) dan pastikan PnL net
+positif secara konsisten, bukan cuma di satu sesi.
 """
 
 import os
@@ -35,12 +48,25 @@ LEVERAGE = 20
 ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
-# Risk Management (MATEMATIS PROFITABLE DENGAN WR 61%)
-FIXED_TP_PCT = 0.008  # Take Profit 0.8% (Net +0.7% setelah fee)
-FIXED_SL_PCT = 0.006  # Stop Loss 0.6% (Net -0.7% setelah fee)
+# ── FEE (round-trip, dipakai juga di live_close — JANGAN dipisah dari sana) ──
+FEE_RATE_PER_SIDE = 0.0005   # 0.05% per sisi (entry & exit) = 0.1% round-trip
 
-# Time Management
-MAX_HOLD_SECONDS = 1200  # Maksimal tahan posisi 20 menit (1.200 detik)
+# ── Risk Management: FIXED MODE ──────────────────────────────────────────
+# RASIO DIBALIK: TP > SL. Ini kunci utama supaya winrate ~60% bisa profitable.
+FIXED_SL_PCT = 0.004   # Stop Loss 0.4%
+FIXED_TP_PCT = 0.007   # Take Profit 0.7%
+
+# ── Risk Management: ATR-ADAPTIVE MODE (opsional, disarankan dicoba) ─────
+# Kalau True, SL/TP dihitung dari ATR simbol tsb, bukan persentase tetap.
+# Lebih representatif karena volatilitas BTC vs token kecil beda jauh.
+USE_ATR_RISK = False     # set True untuk coba mode adaptif
+ATR_SL_MULT = 1.2
+ATR_TP_MULT = 2.2        # multiplier TP > multiplier SL -> rasio tetap terjaga
+MIN_SL_PCT = 0.0025
+MAX_SL_PCT = 0.008
+MIN_TP_PCT = 0.004
+MAX_TP_PCT = 0.012
+MIN_RR_RATIO = 1.5       # jaring pengaman: TP/SL tidak boleh di bawah ini
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -59,7 +85,7 @@ SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
 # Scanning & Monitoring
 SCAN_INTERVAL = 2.0
-MONITOR_INT = 0.2  # Real-time
+MONITOR_INT = 0.2
 BATCH_SIZE = 15
 MAX_WORKERS = 5
 SLOT_FILL_INT = 0.01
@@ -88,7 +114,7 @@ class MarketRegime:
     REGIME_RANGE = "RANGE"
     REGIME_VOLATILE = "VOLATILE"
     REGIME_EXHAUSTION = "EXHAUSTION"
-    
+
     @staticmethod
     def detect(df: pd.DataFrame) -> Tuple[str, float, float]:
         if df is None or len(df) < 55:
@@ -111,7 +137,7 @@ class MarketRegime:
         m5 = row["m5"]
         m5_prev = prev["m5"]
         decelerating = (abs(m5) < abs(m5_prev)) if not np.isnan(m5_prev) else False
-        
+
         if very_strong_trend and bull_stack:
             return MarketRegime.REGIME_TRENDING_BULL, min(adx, 100), 1.0
         elif very_strong_trend and bear_stack:
@@ -148,7 +174,7 @@ class SignalWeights:
         }
         self.history = defaultdict(list)
         self.adaptive_enabled = True
-    
+
     def record_outcome(self, signals: List[str], won: bool):
         for sig in signals:
             base_sig = sig.split('[')[0].strip()
@@ -156,7 +182,7 @@ class SignalWeights:
                 self.history[base_sig].append(1 if won else 0)
                 if len(self.history[base_sig]) > LEARNING_WINDOW:
                     self.history[base_sig] = self.history[base_sig][-LEARNING_WINDOW:]
-    
+
     def get_adjusted_weight(self, signal_name: str) -> float:
         if not self.adaptive_enabled:
             return self.weights.get(signal_name, 10)
@@ -176,97 +202,127 @@ class SignalWeights:
 class SignalScorer:
     def __init__(self, signal_weights: SignalWeights):
         self.weights = signal_weights
-    
+
     def get_signal(self, df: pd.DataFrame, symbol: str = None) -> Tuple[Optional[str], int, List[str], float, str, float]:
         if df is None or len(df) < 55:
             return None, 0, [], 0.0, "UNKNOWN", 0.0
-        
+
         regime, strength, bias = MarketRegime.detect(df)
         long_score, long_signals = self._score_long(df)
         short_score, short_signals = self._score_short(df)
-        
+
         atr = df["atr"].iloc[-2]
-        
+
         if long_score >= MIN_SCORE and long_score > short_score:
             return "LONG", long_score, long_signals, atr, regime, bias
         elif short_score >= MIN_SCORE and short_score > long_score:
             return "SHORT", short_score, short_signals, atr, regime, bias
-            
+
         return None, max(long_score, short_score), [], atr, regime, bias
-    
+
     def _score_long(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
         score = 0
         signals = []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
-        
+
         if p < e5 < e9 < e21 < e50:
             w = self.weights.get_adjusted_weight("ema_bear_stack")
             score += w; signals.append(f"EMA5↓[{w:.0f}]")
-        
+
         m5 = row["m5"]
         if m5 < -0.003:
             w = self.weights.get_adjusted_weight("mom_strong_neg")
             score += w; signals.append(f"Mom{m5*100:.1f}%↓[{w:.0f}]")
-            
+
         mh, mh_p, mh_p2 = row["mh"], prev["mh"], prev2["mh"]
         if mh_p >= 0 and mh < 0:
             w = self.weights.get_adjusted_weight("macd_cross_down")
             score += w; signals.append(f"MACD_X↓[{w:.0f}]")
-            
+
         rsi = row["rsi"]
         if rsi < 32:
             w = self.weights.get_adjusted_weight("rsi_extreme_os")
             score += w; signals.append(f"RSI{rsi:.0f}OS[{w:.0f}]")
-            
+
         return score, signals
-    
+
     def _score_short(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
         score = 0
         signals = []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
-        
+
         if p > e5 > e9 > e21 > e50:
             w = self.weights.get_adjusted_weight("ema_bull_stack")
             score += w; signals.append(f"EMA5↑[{w:.0f}]")
-            
+
         m5 = row["m5"]
         if m5 > 0.003:
             w = self.weights.get_adjusted_weight("mom_strong")
             score += w; signals.append(f"Mom+{m5*100:.1f}%↑[{w:.0f}]")
-            
+
         mh, mh_p, mh_p2 = row["mh"], prev["mh"], prev2["mh"]
         if mh_p <= 0 and mh > 0:
             w = self.weights.get_adjusted_weight("macd_cross_up")
             score += w; signals.append(f"MACD_X↑[{w:.0f}]")
-            
+
         rsi = row["rsi"]
         if rsi > 68:
             w = self.weights.get_adjusted_weight("rsi_extreme_ob")
             score += w; signals.append(f"RSI{rsi:.0f}OB[{w:.0f}]")
-            
+
         return score, signals
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER
+#  RISK MANAGER — FIXED %  ATAU  ATR-ADAPTIVE
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
     @staticmethod
-    def calculate_sl_tp(entry_price: float, direction: str) -> Tuple[float, float, float, float]:
-        sl_distance = entry_price * FIXED_SL_PCT
-        tp_distance = entry_price * FIXED_TP_PCT
-        
+    def _clamp(val, lo, hi):
+        return max(lo, min(hi, val))
+
+    @staticmethod
+    def calculate_sl_tp(entry_price: float, direction: str, atr: float = None) -> Tuple[float, float, float, float]:
+        if USE_ATR_RISK and atr and atr > 0 and entry_price > 0:
+            raw_sl_pct = (atr * ATR_SL_MULT) / entry_price
+            raw_tp_pct = (atr * ATR_TP_MULT) / entry_price
+            sl_pct = RiskManager._clamp(raw_sl_pct, MIN_SL_PCT, MAX_SL_PCT)
+            tp_pct = RiskManager._clamp(raw_tp_pct, MIN_TP_PCT, MAX_TP_PCT)
+            # Jaring pengaman: pastikan rasio TP/SL tidak pernah jatuh di bawah ambang.
+            if tp_pct < sl_pct * MIN_RR_RATIO:
+                tp_pct = min(sl_pct * MIN_RR_RATIO, MAX_TP_PCT)
+        else:
+            sl_pct = FIXED_SL_PCT
+            tp_pct = FIXED_TP_PCT
+
+        sl_distance = entry_price * sl_pct
+        tp_distance = entry_price * tp_pct
+
         if direction == "LONG":
             sl_price = entry_price - sl_distance
             tp_price = entry_price + tp_distance
         else:
             sl_price = entry_price + sl_distance
             tp_price = entry_price - tp_distance
-            
-        return sl_price, tp_price, FIXED_SL_PCT, FIXED_TP_PCT
+
+        return sl_price, tp_price, sl_pct, tp_pct
+
+    @staticmethod
+    def breakeven_winrate(sl_pct: float, tp_pct: float, fee_per_side: float = FEE_RATE_PER_SIDE) -> float:
+        """
+        Winrate minimum yang dibutuhkan supaya EV per trade >= 0,
+        memperhitungkan fee round-trip (entry + exit).
+        fee_pct_of_notional kira-kira = 2 * fee_per_side (saat entry≈exit price).
+        """
+        fee_pct = 2 * fee_per_side
+        eff_sl = sl_pct + fee_pct
+        eff_tp = tp_pct - fee_pct
+        if eff_tp <= 0:
+            return 1.0  # TP kehabisan margin oleh fee -> mustahil profitable
+        return eff_sl / (eff_sl + eff_tp)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -287,12 +343,13 @@ class TradeRecord:
     hold_seconds: float
     timestamp: float = field(default_factory=time.time)
 
+
 class LearningLayer:
     def __init__(self, signal_weights: SignalWeights):
         self.signal_weights = signal_weights
         self.trades: List[TradeRecord] = []
         self.stats_by_regime = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0})
-    
+
     def add_trade(self, trade: TradeRecord):
         self.trades.append(trade)
         regime = trade.regime
@@ -302,12 +359,12 @@ class LearningLayer:
         self.signal_weights.record_outcome(trade.signals, trade.won)
         if len(self.trades) > 1000:
             self.trades = self.trades[-500:]
-    
+
     def get_winrate_by_regime(self, regime: str) -> float:
         stats = self.stats_by_regime[regime]
         total = stats["wins"] + stats["losses"]
         return stats["wins"] / total if total > 0 else 0.5
-    
+
     def get_global_winrate(self) -> float:
         total_wins = sum(s["wins"] for s in self.stats_by_regime.values())
         total_losses = sum(s["losses"] for s in self.stats_by_regime.values())
@@ -316,7 +373,7 @@ class LearningLayer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TRADING STATE & UTILITIES
+#  BOT STATE & UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
 
 _precision_cache = {}
@@ -332,17 +389,9 @@ _macro = {"btc": "UNKNOWN"}
 _ks = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "time_stop": 0,
+    "extreme_tp": 0, "hard_sl": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
-
-# BLOK YANG TADI HILANG SUDAH DIKEMBALIKAN DI SINI ✅
-live_positions = {}
-trade_log = []
-signal_weights = SignalWeights()
-scorer = SignalScorer(signal_weights)
-learning = LearningLayer(signal_weights)
-
 
 def get_precision(symbol):
     if symbol in _precision_cache: return _precision_cache[symbol]
@@ -437,15 +486,25 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  TRADING STATE
+# ═══════════════════════════════════════════════════════════════════════════
+
+live_positions = {}
+trade_log = []
+signal_weights = SignalWeights()
+scorer = SignalScorer(signal_weights)
+learning = LearningLayer(signal_weights)
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  CORE TRADING FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def live_open(orig_direction, score, sigs, price, regime, bias, sym):
+def live_open(orig_direction, score, sigs, price, regime, bias, sym, atr_val=None):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
             return
         live_positions[sym] = {"_r": True}
-    
+
     px_now = price_live(sym)
     if px_now > 0:
         slip = abs(px_now - price) / price
@@ -453,16 +512,17 @@ def live_open(orig_direction, score, sigs, price, regime, bias, sym):
             with _lock: live_positions.pop(sym, None)
             return
         price = px_now
-    
+
     try:
         q_val = qty(sym, price)
     except:
         with _lock: live_positions.pop(sym, None)
         return
-    
+
     actual_side = orig_direction
-    sl_price, tp_price, sl_pct, tp_pct = RiskManager.calculate_sl_tp(price, actual_side)
-    
+
+    sl_price, tp_price, sl_pct, tp_pct = RiskManager.calculate_sl_tp(price, actual_side, atr_val)
+
     pos = {
         "side": actual_side,
         "entry": price,
@@ -479,9 +539,10 @@ def live_open(orig_direction, score, sigs, price, regime, bias, sym):
         "orig_direction": orig_direction
     }
     with _lock: live_positions[sym] = pos
-    
+
     d = "🟢" if actual_side == "LONG" else "🔴"
-    print(f"\n  {d} [ORIGINAL] {sym} {actual_side} @{price:.6g} | SL:{sl_pct*100:.1f}% TP:{tp_pct*100:.1f}%")
+    rr = tp_pct / sl_pct if sl_pct > 0 else 0
+    print(f"\n  {d} [FIXED v20.5] {sym} {actual_side} @{price:.6g} | SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% RR:{rr:.2f}")
     print(f"        Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
@@ -489,23 +550,22 @@ def live_close(sym, reason, price=None):
     with _lock:
         pos = live_positions.pop(sym, None)
     if pos is None or pos.get("_r"): return
-    
+
     if price is None: price = price_live(sym)
     if price == 0: return
-    
+
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-    fee_rate = 0.0005
-    total_fee = (entry * q_val + price * q_val) * fee_rate
+    total_fee = (entry * q_val + price * q_val) * FEE_RATE_PER_SIDE
     pnl = gross_pnl - total_fee
     pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
     hold = time.time() - pos["open_time"]
     won = pnl >= 0
     e = "🟢" if won else "🔴"
-    
-    print(f"  {e} [ORIGINAL] {sym} {side} CLOSE — {reason}")
+
+    print(f"  {e} [FIXED v20.5] {sym} {side} CLOSE — {reason}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
-    
+
     trade = TradeRecord(
         symbol=sym, direction=side, entry_price=entry, exit_price=price,
         pnl=pnl, won=won, regime=pos.get("regime", "UNKNOWN"),
@@ -513,7 +573,7 @@ def live_close(sym, reason, price=None):
         hold_seconds=hold
     )
     learning.add_trade(trade)
-    
+
     _stats["pnl"] += pnl
     _stats["hist"].append(pnl)
     ks_upd(pnl)
@@ -523,11 +583,10 @@ def live_close(sym, reason, price=None):
     else:
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
-    
+
     if "TP" in reason: _stats["extreme_tp"] += 1
     elif "SL" in reason: _stats["hard_sl"] += 1
-    elif "Time" in reason: _stats["time_stop"] += 1
-    
+
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
         "pnl": round(pnl, 5), "reason": reason, "hold": int(hold),
@@ -539,26 +598,18 @@ def live_close(sym, reason, price=None):
 def monitor_positions():
     prices = get_all_prices()
     if not prices: return
-    
-    current_time = time.time()
-    
+
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
         if pos is None or pos.get("_r"): continue
-        
+
         px = prices.get(sym, 0.0)
         if px == 0: continue
-        
+
         side = pos["side"]
         sl_px = pos["sl_price"]
         tp_px = pos["tp_price"]
-        hold_time = current_time - pos["open_time"]
-        
-        # LOGIKA TIME-STOP (Batas Maksimal Tahan Posisi)
-        if hold_time > MAX_HOLD_SECONDS:
-            live_close(sym, "TimeStop", px)
-            continue
-            
+
         if side == "LONG":
             if px <= sl_px:
                 live_close(sym, "HardSL", px); continue
@@ -579,17 +630,17 @@ def scan_one(sym):
         time.sleep(0.002)
         df = ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100)
         if df is None: return None
-        
+
         px = df["close"].iloc[-2]
         if px == 0: return None
-        
+
         direction, score, sigs, atr_val, regime, bias = scorer.get_signal(df, sym)
         if direction is None: return None
-        
+
         px_live = price_live(sym)
         if px_live == 0: return None
-        
-        return (sym, direction, score, sigs, px_live, regime, bias)
+
+        return (sym, direction, score, sigs, px_live, regime, bias, atr_val)
     except Exception as e:
         return None
 
@@ -615,8 +666,11 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.5.1 OPTIMIZED] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} TimeOut:{_stats['time_stop']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
+    be_wr = RiskManager.breakeven_winrate(FIXED_SL_PCT, FIXED_TP_PCT) * 100
+    gap = wr - be_wr
+    gap_e = "✅" if gap >= 0 else "⚠️"
+    print(f"       ┌ [v20.5 FIXED] {n}T WR:{wr:.1f}% (BE:{be_wr:.1f}% {gap_e}{gap:+.1f}pp) W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -625,13 +679,16 @@ def print_full():
     sess = (time.time() - _stats["start"]) / 3600
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
+    be_wr = RiskManager.breakeven_winrate(FIXED_SL_PCT, FIXED_TP_PCT) * 100
+    rr = FIXED_TP_PCT / FIXED_SL_PCT
     print(f"\n  {'─'*70}")
-    print(f"    ✅ NORMAL LOGIC v20.5.1 — MATH RR + TIME STOP")
-    print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
+    print(f"    ✅ FIXED LOGIC v20.5 — TP/SL RATIO CORRECTED")
+    print(f"    🎯 {n}T WR:{wr:.1f}% (breakeven:{be_wr:.1f}%) W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    💰 TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} Timeout:{_stats['time_stop']}")
+    print(f"    💰 TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  Original Direction | TP 0.8% & SL 0.6% | Max Hold: 20m")
+    mode = "ATR-Adaptive" if USE_ATR_RISK else "Fixed %"
+    print(f"    ⚙️  Mode:{mode} | TP {FIXED_TP_PCT*100:.1f}% / SL {FIXED_SL_PCT*100:.1f}% | RR {rr:.2f} | Fee {FEE_RATE_PER_SIDE*200:.2f}% round-trip")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -675,8 +732,8 @@ def t_slot_filler(syms):
                 res.sort(key=lambda x: x[2], reverse=True)
                 for r in res[:slots]:
                     if len(live_positions) >= MAX_POSITIONS: break
-                    sym, orig_dir, sc, sg, px, regime, bias = r
-                    live_open(orig_dir, sc, sg, px, regime, bias, sym)
+                    sym, orig_dir, sc, sg, px, regime, bias, atr_val = r
+                    live_open(orig_dir, sc, sg, px, regime, bias, sym, atr_val)
         except: pass
         time.sleep(SLOT_FILL_INT)
 
@@ -694,8 +751,8 @@ def t_rescan(syms):
                 res.sort(key=lambda x: x[2], reverse=True)
                 for r in res[:slots]:
                     if len(live_positions) >= MAX_POSITIONS: break
-                    sym, orig_dir, sc, sg, px, regime, bias = r
-                    live_open(orig_dir, sc, sg, px, regime, bias, sym)
+                    sym, orig_dir, sc, sg, px, regime, bias, atr_val = r
+                    live_open(orig_dir, sc, sg, px, regime, bias, sym, atr_val)
         except: pass
 
 def t_macro():
@@ -713,12 +770,16 @@ def t_macro():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_bot():
+    be_wr = RiskManager.breakeven_winrate(FIXED_SL_PCT, FIXED_TP_PCT) * 100
+    rr = FIXED_TP_PCT / FIXED_SL_PCT
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ NORMAL LOGIC v20.5.1 — MATH EXPECTANCY & TIME STOP FIXED       ║")
-    print("║  ✅ Entry Asli (LONG = LONG, SHORT = SHORT)                        ║")
-    print("║  ✅ RR 1:1 (TP 0.8%, SL 0.6%) -> Cukup Win Rate 50% untuk Profit   ║")
-    print("║  ✅ Time Stop Active: Tutup posisi otomatis jika > 20 menit        ║")
+    print("║  ✅ FIXED LOGIC v20.5 — TP/SL RATIO CORRECTED                      ║")
+    print("║  ✅ Entry ASLI (LONG -> LONG, SHORT -> SHORT)                      ║")
+    print(f"║  ✅ TP {FIXED_TP_PCT*100:.1f}% / SL {FIXED_SL_PCT*100:.1f}% | RR {rr:.2f} | Breakeven WR {be_wr:.1f}%" + " "*(20-len(f"{be_wr:.1f}")) + "║")
+    print("║  ✅ Fast Polling Anti-Jebol Active                                 ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
+    print(f"  ⚠️  Strategi ini butuh winrate aktual >= {be_wr:.1f}% supaya profitable setelah fee.")
+    print(f"  ⚠️  Pantau gap WR-vs-breakeven di print_inline() tiap kali posisi close.\n")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
         syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
